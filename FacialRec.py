@@ -8,15 +8,22 @@ Detection methods:
   4. Fusion score – weighted combination → single drowsiness level
 
 Dependencies:
-    pip install opencv-python mediapipe scipy numpy
+    pip3 install opencv-python "mediapipe>=0.10" numpy
+
+Note: scipy is NOT required — euclidean distance is computed inline.
+      This code uses the mediapipe 0.10+ FaceLandmarker API.
 """
 
 import cv2
 import time
+import math
 import numpy as np
 from collections import deque
-from scipy.spatial import distance as dist
+
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import FaceLandmarkerOptions, FaceLandmarker, RunningMode
 
 # ──────────────────────────────────────────────
 # Tunable thresholds
@@ -61,23 +68,27 @@ RIGHT_MOUTH   = 287
 # ──────────────────────────────────────────────
 # Geometry helpers
 # ──────────────────────────────────────────────
+def euclidean(p1, p2):
+    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
 def eye_aspect_ratio(landmarks, eye_indices, w, h):
-    pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in eye_indices]
+    pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in eye_indices]
     # Vertical distances
-    A = dist.euclidean(pts[1], pts[5])
-    B = dist.euclidean(pts[2], pts[4])
+    A = euclidean(pts[1], pts[5])
+    B = euclidean(pts[2], pts[4])
     # Horizontal distance
-    C = dist.euclidean(pts[0], pts[3])
+    C = euclidean(pts[0], pts[3])
     return (A + B) / (2.0 * C) if C > 0 else 0.0
 
 
 def mouth_aspect_ratio(landmarks, mouth_indices, w, h):
-    pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in mouth_indices]
+    pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in mouth_indices]
     # Vertical distances (top-bottom pairs)
-    A = dist.euclidean(pts[2], pts[6])
-    B = dist.euclidean(pts[3], pts[7])
+    A = euclidean(pts[2], pts[6])
+    B = euclidean(pts[3], pts[7])
     # Horizontal distance
-    C = dist.euclidean(pts[0], pts[1])
+    C = euclidean(pts[0], pts[1])
     return (A + B) / (2.0 * C) if C > 0 else 0.0
 
 
@@ -177,13 +188,30 @@ def draw_alert(frame):
 # Main
 # ──────────────────────────────────────────────
 def main():
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
+    # Download the model if not present
+    import urllib.request, os
+    MODEL_PATH = "face_landmarker.task"
+    MODEL_URL  = (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
     )
+    if not os.path.exists(MODEL_PATH):
+        print("Downloading face_landmarker.task model (~30 MB)…")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("Download complete.")
+
+    # Build FaceLandmarker (new 0.10+ API)
+    options = FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=True,
+    )
+    face_landmarker = FaceLandmarker.create_from_options(options)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -191,14 +219,12 @@ def main():
         return
 
     # ── State ──────────────────────────────────
-    perclos_buffer   = deque(maxlen=PERCLOS_WINDOW)   # 1 = closed, 0 = open
-    ear_consec       = 0
-
-    yawn_start       = None
-    yawn_count       = 0
-
-    alert_start      = None  # when score crossed ALERT_SCORE
-    alerting         = False
+    perclos_buffer = deque(maxlen=PERCLOS_WINDOW)
+    ear_consec     = 0
+    yawn_start     = None
+    yawn_count     = 0
+    alert_start    = None
+    alerting       = False
 
     print("Drowsiness detection running. Press 'q' to quit.")
 
@@ -209,17 +235,23 @@ def main():
             break
 
         h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb)
 
-        # Default metric values (no face detected)
+        # Convert to MediaPipe Image for the new API
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        )
+        timestamp_ms = int(time.time() * 1000)
+        result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        # Default metric values
         ear = mar = 0.0
         pitch = roll = 0.0
         face_detected = False
 
-        if results.multi_face_landmarks:
+        if result.face_landmarks:
             face_detected = True
-            lm = results.multi_face_landmarks[0].landmark
+            lm = result.face_landmarks[0]   # list of NormalizedLandmark
 
             # ── EAR ────────────────────────────
             left_ear  = eye_aspect_ratio(lm, LEFT_EYE,  w, h)
@@ -228,26 +260,33 @@ def main():
 
             eye_closed = ear < EAR_THRESHOLD
             perclos_buffer.append(1 if eye_closed else 0)
-
-            if eye_closed:
-                ear_consec += 1
-            else:
-                ear_consec = 0
+            ear_consec = ear_consec + 1 if eye_closed else 0
 
             # ── MAR / Yawn ──────────────────────
             mar = mouth_aspect_ratio(lm, MOUTH, w, h)
-
             if mar > MAR_THRESHOLD:
                 if yawn_start is None:
                     yawn_start = time.time()
                 elif time.time() - yawn_start >= YAWN_MIN_DURATION:
                     yawn_count += 1
-                    yawn_start = None          # reset for next yawn
+                    yawn_start = None
             else:
                 yawn_start = None
 
-            # ── Head pose ───────────────────────
-            pitch, roll = get_head_angles(lm, w, h)
+            # ── Head pose via transformation matrix ─
+            if result.facial_transformation_matrixes:
+                mat = np.array(result.facial_transformation_matrixes[0].data).reshape(4, 4)
+                # Extract Euler angles from rotation sub-matrix
+                r = mat[:3, :3]
+                sy = math.sqrt(r[0, 0] ** 2 + r[1, 0] ** 2)
+                if sy > 1e-6:
+                    pitch = math.degrees(math.atan2(-r[2, 0], sy))
+                    roll  = math.degrees(math.atan2(r[2, 1], r[2, 2]))
+                else:
+                    pitch = math.degrees(math.atan2(-r[2, 0], sy))
+                    roll  = 0.0
+            else:
+                pitch, roll = get_head_angles(lm, w, h)
 
             # Draw landmark dots for eyes and mouth
             for idx in LEFT_EYE + RIGHT_EYE + MOUTH:
@@ -263,19 +302,18 @@ def main():
         roll_score  = min(abs(roll)  / ROLL_THRESHOLD,  1.0)
         head_score  = max(pitch_score, roll_score)
 
-        # ── Yawn score (decays slowly) ──────────
-        # Each yawn contributes ~33 points; decays after 60 s
+        # ── Yawn score ─────────────────────────
         yawn_score = min(yawn_count / 3.0, 1.0)
 
         # ── Fusion score (0-100) ───────────────
         if face_detected:
             fusion = (
-                W_PERCLOS   * perclos   +
+                W_PERCLOS   * perclos    +
                 W_YAWN      * yawn_score +
                 W_HEAD_POSE * head_score
             ) * 100
         else:
-            fusion = 0.0   # can't assess without a face
+            fusion = 0.0
 
         # ── Alert logic ────────────────────────
         if fusion >= ALERT_SCORE:
@@ -293,17 +331,16 @@ def main():
         draw_score_bar(frame, fusion)
         draw_metrics(frame, ear, mar, pitch, roll, perclos)
 
-        # Status tags
         if not face_detected:
             cv2.putText(frame, "No face detected", (w - 200, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-        if ear < EAR_THRESHOLD and face_detected:
+        if face_detected and ear < EAR_THRESHOLD:
             cv2.putText(frame, "Eyes closed", (w - 160, 55),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1)
-        if mar > MAR_THRESHOLD and face_detected:
+        if face_detected and mar > MAR_THRESHOLD:
             cv2.putText(frame, "Yawning", (w - 130, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 1)
-        if abs(pitch) > PITCH_THRESHOLD and face_detected:
+        if face_detected and abs(pitch) > PITCH_THRESHOLD:
             cv2.putText(frame, "Head nodding", (w - 170, 105),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 1)
 
@@ -316,7 +353,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-    face_mesh.close()
+    face_landmarker.close()
 
 
 if __name__ == "__main__":
