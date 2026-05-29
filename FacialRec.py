@@ -2,16 +2,15 @@
 Enhanced Driver Drowsiness Detection
 -------------------------------------
 Detection methods:
-  1. EAR  – Eye Aspect Ratio (eye closure)
-  2. MAR  – Mouth Aspect Ratio (yawning)
-  3. Head pose – pitch/roll nodding via facial landmarks
-  4. Fusion score – weighted combination → single drowsiness level
+  1. EAR      – Eye Aspect Ratio (eye closure)
+  2. MAR      – Mouth Aspect Ratio (yawning)
+  3. Head pose – pitch/roll from MediaPipe face matrix
+  4. Gyro     – MPU6050 angular velocity (head movement speed)
+  5. FSR      – Pressure sensor (driver seated gate)
+  6. Fusion   – Weighted combination → single drowsiness score
 
 Dependencies:
-    pip3 install opencv-python "mediapipe>=0.10" numpy
-
-Note: scipy is NOT required — euclidean distance is computed inline.
-      This code uses the mediapipe 0.10+ FaceLandmarker API.
+    pip3 install opencv-python "mediapipe>=0.10" numpy pyserial
 """
 
 import cv2
@@ -19,6 +18,8 @@ import time
 import math
 import numpy as np
 from collections import deque
+import serial
+import serial.tools.list_ports
 
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
@@ -26,44 +27,87 @@ from mediapipe.tasks.python import vision as mp_vision
 from mediapipe.tasks.python.vision import FaceLandmarkerOptions, FaceLandmarker, RunningMode
 
 # ──────────────────────────────────────────────
-# Tunable thresholds
+# Arduino / Serial config
 # ──────────────────────────────────────────────
-EAR_THRESHOLD       = 0.22   # below → eye considered closed
-MAR_THRESHOLD       = 0.6    # above → mouth considered open (yawn)
-PITCH_THRESHOLD     = 15     # degrees forward head tilt (nodding)
-ROLL_THRESHOLD      = 20     # degrees sideways tilt
+ARDUINO_PORT  = None   # None = auto-detect, or set e.g. '/dev/tty.usbmodem1101'
+ARDUINO_BAUD  = 9600
+FSR_PIN       = 4      # ESP32S3 analog pin for FSR
+FSR_THRESHOLD = 500    # raw ADC value — above = driver seated
 
-EAR_CONSEC_FRAMES   = 3      # frames EAR must stay low before counting
-YAWN_MIN_DURATION   = 1.5    # seconds mouth must stay open to count as yawn
+# ──────────────────────────────────────────────
+# Drowsiness thresholds
+# ──────────────────────────────────────────────
+EAR_THRESHOLD      = 0.22   # eye aspect ratio below this = closed
+MAR_THRESHOLD      = 0.6    # mouth aspect ratio above this = yawning
+PITCH_THRESHOLD    = 15     # degrees forward head nod
+ROLL_THRESHOLD     = 20     # degrees sideways tilt
+YAWN_MIN_DURATION  = 1.5    # seconds mouth open to count as yawn
+ALERT_SCORE        = 60     # fusion score to trigger alert
+ALERT_DURATION     = 2.0    # seconds score must stay above threshold
+PERCLOS_WINDOW     = 90     # rolling frame window (~3s at 30fps)
 
-ALERT_SCORE         = 60     # fusion score (0-100) that triggers alert
-ALERT_DURATION      = 2.0    # seconds score must stay above threshold
-
-# Rolling window for PERCLOS (last N frames)
-PERCLOS_WINDOW      = 90     # ~3 s at 30 fps
+# Gyro thresholds (rad/s) — sudden head movement = drowsy jerk
+GYRO_JERK_THRESHOLD = 1.5   # rad/s — fast head snap indicates microsleep recovery
+GYRO_WINDOW         = 30    # frames to track gyro activity
 
 # Fusion weights (must sum to 1.0)
-W_PERCLOS   = 0.45
-W_YAWN      = 0.25
-W_HEAD_POSE = 0.30
+W_PERCLOS   = 0.35
+W_YAWN      = 0.20
+W_HEAD_POSE = 0.25
+W_GYRO      = 0.20
 
 # ──────────────────────────────────────────────
 # MediaPipe landmark indices
 # ──────────────────────────────────────────────
-# Left eye
 LEFT_EYE  = [362, 385, 387, 263, 373, 380]
-# Right eye
 RIGHT_EYE = [33,  160, 158, 133, 153, 144]
-# Mouth (outer)
 MOUTH     = [61, 291, 39, 181, 0, 17, 269, 405]
-# Head pose reference points
-NOSE_TIP      = 1
-CHIN          = 152
-LEFT_EYE_L    = 226
-RIGHT_EYE_R   = 446
-LEFT_MOUTH    = 57
-RIGHT_MOUTH   = 287
+NOSE_TIP  = 1
+CHIN      = 152
+LEFT_EYE_L  = 226
+RIGHT_EYE_R = 446
+LEFT_MOUTH  = 57
+RIGHT_MOUTH = 287
 
+# ──────────────────────────────────────────────
+# Serial helpers
+# ──────────────────────────────────────────────
+def find_arduino_port():
+    ports = serial.tools.list_ports.comports()
+    for p in ports:
+        desc = (p.description or "").lower()
+        if any(k in desc for k in ("arduino", "usbmodem", "usbserial", "ch340", "cp210", "esp")):
+            return p.device
+    return ports[0].device if ports else None
+
+
+def connect_arduino():
+    port = ARDUINO_PORT or find_arduino_port()
+    if port is None:
+        print("No Arduino found — running without sensors.")
+        return None
+    try:
+        ser = serial.Serial(port, ARDUINO_BAUD, timeout=0.1)
+        time.sleep(2)
+        print(f"Arduino connected on {port}")
+        return ser
+    except Exception as e:
+        print(f"Could not connect to Arduino ({e}) — running without sensors.")
+        return None
+
+
+def parse_serial(line):
+    """
+    Parse CSV line from Arduino: fsr,ax,ay,az,gx,gy,gz
+    Returns (fsr, ax, ay, az, gx, gy, gz) or None on error.
+    """
+    try:
+        parts = line.strip().split(",")
+        if len(parts) == 7:
+            return tuple(float(p) for p in parts)
+    except Exception:
+        pass
+    return None
 
 # ──────────────────────────────────────────────
 # Geometry helpers
@@ -74,67 +118,50 @@ def euclidean(p1, p2):
 
 def eye_aspect_ratio(landmarks, eye_indices, w, h):
     pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in eye_indices]
-    # Vertical distances
     A = euclidean(pts[1], pts[5])
     B = euclidean(pts[2], pts[4])
-    # Horizontal distance
     C = euclidean(pts[0], pts[3])
     return (A + B) / (2.0 * C) if C > 0 else 0.0
 
 
 def mouth_aspect_ratio(landmarks, mouth_indices, w, h):
     pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in mouth_indices]
-    # Vertical distances (top-bottom pairs)
     A = euclidean(pts[2], pts[6])
     B = euclidean(pts[3], pts[7])
-    # Horizontal distance
     C = euclidean(pts[0], pts[1])
     return (A + B) / (2.0 * C) if C > 0 else 0.0
 
 
 def get_head_angles(landmarks, w, h):
-    """
-    Estimate pitch (nod) and roll (tilt) using solvePnP.
-    Returns (pitch_deg, roll_deg).
-    """
     model_points = np.array([
-        [0.0,    0.0,    0.0   ],   # nose tip
-        [0.0,   -330.0, -65.0 ],   # chin
-        [-225.0, 170.0, -135.0],   # left eye left corner
-        [225.0,  170.0, -135.0],   # right eye right corner
-        [-150.0,-150.0, -125.0],   # left mouth corner
-        [150.0, -150.0, -125.0],   # right mouth corner
+        [0.0,    0.0,    0.0   ],
+        [0.0,   -330.0, -65.0 ],
+        [-225.0, 170.0, -135.0],
+        [225.0,  170.0, -135.0],
+        [-150.0,-150.0, -125.0],
+        [150.0, -150.0, -125.0],
     ], dtype=np.float64)
-
-    def lm(idx):
-        return (landmarks[idx].x * w, landmarks[idx].y * h)
-
+    def lm(idx): return (landmarks[idx].x * w, landmarks[idx].y * h)
     image_points = np.array([
         lm(NOSE_TIP), lm(CHIN),
         lm(LEFT_EYE_L), lm(RIGHT_EYE_R),
         lm(LEFT_MOUTH), lm(RIGHT_MOUTH),
     ], dtype=np.float64)
-
     focal_length = w
     cam_matrix = np.array([
         [focal_length, 0, w / 2],
         [0, focal_length, h / 2],
         [0, 0, 1]
     ], dtype=np.float64)
-    dist_coeffs = np.zeros((4, 1))
-
     success, rvec, _ = cv2.solvePnP(
-        model_points, image_points, cam_matrix, dist_coeffs,
+        model_points, image_points, cam_matrix, np.zeros((4, 1)),
         flags=cv2.SOLVEPNP_ITERATIVE
     )
     if not success:
         return 0.0, 0.0
-
     rmat, _ = cv2.Rodrigues(rvec)
-    # Decompose into Euler angles
     sy = np.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
-    singular = sy < 1e-6
-    if not singular:
+    if sy > 1e-6:
         pitch = np.degrees(np.arctan2(-rmat[2, 0], sy))
         roll  = np.degrees(np.arctan2(rmat[2, 1], rmat[2, 2]))
     else:
@@ -142,53 +169,66 @@ def get_head_angles(landmarks, w, h):
         roll  = 0.0
     return pitch, roll
 
-
 # ──────────────────────────────────────────────
 # Overlay helpers
 # ──────────────────────────────────────────────
-BAR_X, BAR_Y, BAR_W, BAR_H = 20, 20, 200, 24
-
-def draw_score_bar(frame, score):
-    """Draw a colour-coded drowsiness score bar."""
-    filled = int(BAR_W * score / 100)
-    color = (0, 255, 0) if score < 40 else (0, 165, 255) if score < ALERT_SCORE else (0, 0, 255)
-    cv2.rectangle(frame, (BAR_X, BAR_Y), (BAR_X + BAR_W, BAR_Y + BAR_H), (50, 50, 50), -1)
-    cv2.rectangle(frame, (BAR_X, BAR_Y), (BAR_X + filled, BAR_Y + BAR_H), color, -1)
-    cv2.rectangle(frame, (BAR_X, BAR_Y), (BAR_X + BAR_W, BAR_Y + BAR_H), (200, 200, 200), 1)
-    cv2.putText(frame, f"Drowsiness: {score:.0f}%", (BAR_X, BAR_Y + BAR_H + 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+BAR_X, BAR_Y, BAR_W, BAR_H = 20, 20, 200, 22
 
 
-def draw_metrics(frame, ear, mar, pitch, roll, perclos):
-    """Small HUD in bottom-left."""
+def draw_bar(frame, y, label, value, max_val, color_low, color_high, threshold=None):
+    """Generic horizontal bar."""
+    filled = int(BAR_W * min(value, max_val) / max_val)
+    pct    = value / max_val * 100
+    color  = color_high if value / max_val > 0.6 else color_low
+    cv2.rectangle(frame, (BAR_X, y), (BAR_X + BAR_W, y + BAR_H), (50, 50, 50), -1)
+    cv2.rectangle(frame, (BAR_X, y), (BAR_X + filled, y + BAR_H), color, -1)
+    cv2.rectangle(frame, (BAR_X, y), (BAR_X + BAR_W, y + BAR_H), (200, 200, 200), 1)
+    if threshold is not None:
+        tx = BAR_X + int(BAR_W * threshold / max_val)
+        cv2.line(frame, (tx, y - 2), (tx, y + BAR_H + 2), (255, 255, 0), 2)
+    cv2.putText(frame, f"{label}: {pct:.0f}%",
+                (BAR_X, y + BAR_H + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+
+
+def draw_hud(frame, ear, mar, pitch, roll, perclos,
+             fsr_raw, gyro_mag, driver_present, arduino_connected):
+    """Bottom-left metrics panel."""
     h = frame.shape[0]
+    seat_str = "Seated" if driver_present else "NOT SEATED"
+    gyro_str = f"{gyro_mag:.2f} rad/s"
     lines = [
-        f"EAR:     {ear:.3f}",
-        f"MAR:     {mar:.3f}",
-        f"Pitch:   {pitch:.1f}deg",
-        f"Roll:    {roll:.1f}deg",
-        f"PERCLOS: {perclos*100:.1f}%",
+        f"EAR:      {ear:.3f}",
+        f"MAR:      {mar:.3f}",
+        f"Pitch:    {pitch:.1f}deg",
+        f"Roll:     {roll:.1f}deg",
+        f"PERCLOS:  {perclos*100:.1f}%",
+        f"Gyro mag: {gyro_str}" if arduino_connected else "Gyro: no sensor",
+        f"Pressure: {fsr_raw}" if arduino_connected else "Pressure: no sensor",
+        f"Seat:     {seat_str}",
     ]
     for i, line in enumerate(lines):
-        cv2.putText(frame, line, (10, h - 20 - (len(lines) - 1 - i) * 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+        cv2.putText(frame, line,
+                    (10, h - 20 - (len(lines) - 1 - i) * 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1)
 
 
 def draw_alert(frame):
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), (0, 0, 180), -1)
     cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
-    cv2.putText(frame, "⚠  DROWSINESS ALERT!", (40, frame.shape[0] // 2),
-                cv2.FONT_HERSHEY_DUPLEX, 1.1, (0, 0, 255), 3)
-    cv2.putText(frame, "Please pull over and rest.", (60, frame.shape[0] // 2 + 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(frame, "DROWSINESS ALERT!",
+                (40, frame.shape[0] // 2),
+                cv2.FONT_HERSHEY_DUPLEX, 1.2, (0, 0, 255), 3)
+    cv2.putText(frame, "Please pull over and rest.",
+                (60, frame.shape[0] // 2 + 45),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
 
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 def main():
-    # Download the model if not present
     import urllib.request, os
     MODEL_PATH = "face_landmarker.task"
     MODEL_URL  = (
@@ -196,11 +236,12 @@ def main():
         "face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
     )
     if not os.path.exists(MODEL_PATH):
-        print("Downloading face_landmarker.task model (~30 MB)…")
+        print("Downloading face_landmarker.task (~30 MB)…")
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
         print("Download complete.")
 
-    # Build FaceLandmarker (new 0.10+ API)
+    arduino = connect_arduino()
+
     options = FaceLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=RunningMode.VIDEO,
@@ -219,12 +260,18 @@ def main():
         return
 
     # ── State ──────────────────────────────────
-    perclos_buffer = deque(maxlen=PERCLOS_WINDOW)
-    ear_consec     = 0
-    yawn_start     = None
-    yawn_count     = 0
-    alert_start    = None
-    alerting       = False
+    perclos_buffer  = deque(maxlen=PERCLOS_WINDOW)
+    gyro_buffer     = deque(maxlen=GYRO_WINDOW)   # magnitude of gyro each frame
+    ear_consec      = 0
+    yawn_start      = None
+    yawn_count      = 0
+    alert_start     = None
+    alerting        = False
+    driver_present  = True
+    fsr_raw         = 0
+    gyro_mag        = 0.0   # current gyro magnitude (rad/s)
+    ax = ay = az    = 0.0
+    gx = gy = gz    = 0.0
 
     print("Drowsiness detection running. Press 'q' to quit.")
 
@@ -236,7 +283,22 @@ def main():
 
         h, w = frame.shape[:2]
 
-        # Convert to MediaPipe Image for the new API
+        # ── Read from Arduino (CSV: fsr,ax,ay,az,gx,gy,gz) ──
+        if arduino and arduino.in_waiting > 0:
+            try:
+                line = arduino.readline().decode('utf-8')
+                parsed = parse_serial(line)
+                if parsed:
+                    fsr_raw, ax, ay, az, gx, gy, gz = parsed
+                    driver_present = fsr_raw > FSR_THRESHOLD
+                    gyro_mag = math.sqrt(gx**2 + gy**2 + gz**2)
+            except Exception:
+                pass
+
+        # Track gyro magnitude over time
+        gyro_buffer.append(gyro_mag)
+
+        # ── MediaPipe face detection ──────────
         mp_image = mp.Image(
             image_format=mp.ImageFormat.SRGB,
             data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -244,25 +306,22 @@ def main():
         timestamp_ms = int(time.time() * 1000)
         result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
 
-        # Default metric values
-        ear = mar = 0.0
-        pitch = roll = 0.0
+        ear = mar = pitch = roll = 0.0
         face_detected = False
 
         if result.face_landmarks:
             face_detected = True
-            lm = result.face_landmarks[0]   # list of NormalizedLandmark
+            lm = result.face_landmarks[0]
 
-            # ── EAR ────────────────────────────
+            # EAR
             left_ear  = eye_aspect_ratio(lm, LEFT_EYE,  w, h)
             right_ear = eye_aspect_ratio(lm, RIGHT_EYE, w, h)
             ear = (left_ear + right_ear) / 2.0
-
             eye_closed = ear < EAR_THRESHOLD
             perclos_buffer.append(1 if eye_closed else 0)
             ear_consec = ear_consec + 1 if eye_closed else 0
 
-            # ── MAR / Yawn ──────────────────────
+            # MAR / Yawn
             mar = mouth_aspect_ratio(lm, MOUTH, w, h)
             if mar > MAR_THRESHOLD:
                 if yawn_start is None:
@@ -273,50 +332,46 @@ def main():
             else:
                 yawn_start = None
 
-            # ── Head pose via transformation matrix ─
+            # Head pose
             if result.facial_transformation_matrixes:
                 mat = np.array(result.facial_transformation_matrixes[0].data).reshape(4, 4)
-                # Extract Euler angles from rotation sub-matrix
                 r = mat[:3, :3]
                 sy = math.sqrt(r[0, 0] ** 2 + r[1, 0] ** 2)
-                if sy > 1e-6:
-                    pitch = math.degrees(math.atan2(-r[2, 0], sy))
-                    roll  = math.degrees(math.atan2(r[2, 1], r[2, 2]))
-                else:
-                    pitch = math.degrees(math.atan2(-r[2, 0], sy))
-                    roll  = 0.0
+                pitch = math.degrees(math.atan2(-r[2, 0], sy))
+                roll  = math.degrees(math.atan2(r[2, 1], r[2, 2])) if sy > 1e-6 else 0.0
             else:
                 pitch, roll = get_head_angles(lm, w, h)
 
-            # Draw landmark dots for eyes and mouth
+            # Draw landmark dots
             for idx in LEFT_EYE + RIGHT_EYE + MOUTH:
-                x_px = int(lm[idx].x * w)
-                y_px = int(lm[idx].y * h)
-                cv2.circle(frame, (x_px, y_px), 2, (0, 255, 255), -1)
+                cv2.circle(frame, (int(lm[idx].x * w), int(lm[idx].y * h)), 2, (0, 255, 255), -1)
 
-        # ── PERCLOS ────────────────────────────
+        # ── Scores ────────────────────────────
         perclos = np.mean(perclos_buffer) if perclos_buffer else 0.0
 
-        # ── Head pose score (0-1) ───────────────
         pitch_score = min(abs(pitch) / PITCH_THRESHOLD, 1.0)
         roll_score  = min(abs(roll)  / ROLL_THRESHOLD,  1.0)
         head_score  = max(pitch_score, roll_score)
 
-        # ── Yawn score ─────────────────────────
-        yawn_score = min(yawn_count / 3.0, 1.0)
+        yawn_score  = min(yawn_count / 3.0, 1.0)
 
-        # ── Fusion score (0-100) ───────────────
+        # Gyro score: high average magnitude = jerky head movements (microsleep recovery)
+        avg_gyro    = np.mean(gyro_buffer) if gyro_buffer else 0.0
+        gyro_score  = min(avg_gyro / GYRO_JERK_THRESHOLD, 1.0) if arduino else 0.0
+
+        # Fusion
         if face_detected:
             fusion = (
                 W_PERCLOS   * perclos    +
                 W_YAWN      * yawn_score +
-                W_HEAD_POSE * head_score
+                W_HEAD_POSE * head_score +
+                W_GYRO      * gyro_score
             ) * 100
         else:
             fusion = 0.0
 
-        # ── Alert logic ────────────────────────
-        if fusion >= ALERT_SCORE:
+        # ── Alert ─────────────────────────────
+        if fusion >= ALERT_SCORE and driver_present:
             if alert_start is None:
                 alert_start = time.time()
             alerting = (time.time() - alert_start) >= ALERT_DURATION
@@ -324,25 +379,47 @@ def main():
             alert_start = None
             alerting = False
 
-        # ── Draw overlay ───────────────────────
+        # ── Draw ──────────────────────────────
         if alerting:
             draw_alert(frame)
 
-        draw_score_bar(frame, fusion)
-        draw_metrics(frame, ear, mar, pitch, roll, perclos)
+        # Bars (stacked)
+        draw_bar(frame, BAR_Y,
+                 "Drowsiness", fusion, 100,
+                 (0, 255, 0), (0, 0, 255),
+                 threshold=ALERT_SCORE)
 
+        if arduino:
+            draw_bar(frame, BAR_Y + BAR_H + 30,
+                     "Pressure", fsr_raw, 4095,
+                     (0, 0, 255), (0, 255, 0),
+                     threshold=FSR_THRESHOLD)
+            draw_bar(frame, BAR_Y + (BAR_H + 30) * 2,
+                     "Gyro activity", avg_gyro, GYRO_JERK_THRESHOLD,
+                     (0, 255, 0), (0, 165, 255))
+
+        draw_hud(frame, ear, mar, pitch, roll, perclos,
+                 fsr_raw, gyro_mag, driver_present,
+                 arduino_connected=(arduino is not None))
+
+        # Status tags top-right
+        tags = []
         if not face_detected:
-            cv2.putText(frame, "No face detected", (w - 200, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+            tags.append(("No face detected", (0, 165, 255)))
         if face_detected and ear < EAR_THRESHOLD:
-            cv2.putText(frame, "Eyes closed", (w - 160, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1)
+            tags.append(("Eyes closed", (0, 0, 255)))
         if face_detected and mar > MAR_THRESHOLD:
-            cv2.putText(frame, "Yawning", (w - 130, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 1)
+            tags.append(("Yawning", (0, 165, 255)))
         if face_detected and abs(pitch) > PITCH_THRESHOLD:
-            cv2.putText(frame, "Head nodding", (w - 170, 105),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 1)
+            tags.append(("Head nodding", (0, 165, 255)))
+        if arduino and gyro_mag > GYRO_JERK_THRESHOLD:
+            tags.append(("Head jerk detected", (0, 165, 255)))
+        if arduino and not driver_present:
+            tags.append(("NOT SEATED — alerts paused", (0, 0, 255)))
+
+        for i, (tag, col) in enumerate(tags):
+            cv2.putText(frame, tag, (w - 260, 30 + i * 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1)
 
         cv2.putText(frame, f"Yawns: {yawn_count}", (w - 120, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
@@ -354,6 +431,8 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
     face_landmarker.close()
+    if arduino:
+        arduino.close()
 
 
 if __name__ == "__main__":
